@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import OneHotEncoder
 from gensim.models import Word2Vec, KeyedVectors
 import nltk
-from model import LyricsGAN, CombinedLyricsLoss, SentimentLoss, LineLenLoss, SongLenLoss, DiversityLoss,EntropyRegularizationLoss, CosineSimilarityLoss
+from model import get_song, LyricsGAN, CombinedLyricsLoss, SentimentLoss, LineLenLoss, SongLenLoss, DiversityLoss,EntropyRegularizationLoss, CosineSimilarityLoss
 from dataloaders import MIDIDataset
 nltk.download('vader_lexicon')
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
@@ -277,4 +277,119 @@ model.train_model(
 )
 
 
+def get_song_structure(song):
+  line_lengths = [len(line.split()) for line in get_song(song).split('\n')]
+  return len(line_lengths), np.mean(line_lengths) if line_lengths else 0
 
+
+def get_diversity_score(sequence):
+  unique_words = len(set(sequence))
+  total_words = len(sequence)
+  diversity_ratio = unique_words / total_words
+  return diversity_ratio
+
+
+def evaluate_model(model, dataloader, num_generations=5):
+  model.eval()
+  cosine_sim = nn.CosineSimilarity(dim=0)
+  sentiment_loss = SentimentLoss()
+
+  total_sentiment_similarity = 0
+  total_cosine_similarity = 0
+  total_structure_similarity = 0
+  total_diversity_similarity = 0
+  total_songs = len(dataloader)
+
+  with torch.no_grad():
+    for inputs, _, midi_vector in dataloader:
+      inputs = inputs.to(model.device)
+      midi_vector = midi_vector.to(model.device)
+
+      original_song = [model.word2vec_model.index_to_key[idx.item()] for idx in inputs[0]] + ["pad"]
+      first_word = original_song[0]
+
+      song_sentiment_similarity = 0.0
+      song_cosine_similarity = 0.0
+      song_structure_similarity = 0.0
+      song_diversity_similarity = 0.0
+
+      for _ in range(num_generations):
+        generated_song = model.generate_song(first_word, midi_vector[0])
+        generated_song += ["pad"] * (len(original_song) - len(generated_song))
+
+        # Calculate sentiment similarity using SentimentLoss
+        sentiment_similarity = 1 - sentiment_loss(
+          np.array([generated_song]), np.array([original_song])
+        )
+        song_sentiment_similarity += sentiment_similarity
+
+        # Calculate cosine similarity
+        generated_indices = [
+          model.word2vec_model.key_to_index[word]
+          for word in generated_song if word in model.word2vec_model.key_to_index
+        ]
+        generated_vec = model.embedding(
+          torch.tensor(generated_indices).to(model.device)
+        )
+        original_vec = model.embedding(torch.cat((inputs, inputs[:, -1].unsqueeze(1)), dim=-1))
+
+        cosine_similarity = torch.mean(cosine_sim(generated_vec, original_vec.squeeze(0))).item()
+        song_cosine_similarity += cosine_similarity
+
+        # Calculate structure similarity
+        gen_song_len, gen_avg_line_len = get_song_structure(generated_song)
+        orig_song_len, orig_avg_line_len = get_song_structure(original_song)
+
+        # Calculate diversity similarity
+        gen_diversity = get_diversity_score(generated_song)
+        orig_diversity = get_diversity_score(original_song)
+        diversity_similarity = 1 - abs(gen_diversity - orig_diversity) / max(gen_diversity, orig_diversity)
+        song_diversity_similarity += diversity_similarity
+
+        song_len_similarity = 1 - abs(gen_song_len - orig_song_len) / max(gen_song_len, orig_song_len)
+        line_len_similarity = 1 - abs(gen_avg_line_len - orig_avg_line_len) / max(gen_avg_line_len, orig_avg_line_len)
+        structure_similarity = (song_len_similarity + line_len_similarity) / 2
+        song_structure_similarity += structure_similarity
+
+      # Calculate average similarities for this song and add to the total score
+      avg_song_sentiment_similarity = song_sentiment_similarity / num_generations
+      avg_song_cosine_similarity = song_cosine_similarity / num_generations
+      avg_song_structure_similarity = song_structure_similarity / num_generations
+      avg_song_diversity_similarity = song_diversity_similarity / num_generations
+
+      total_sentiment_similarity += avg_song_sentiment_similarity
+      total_cosine_similarity += avg_song_cosine_similarity
+      total_structure_similarity += avg_song_structure_similarity
+      total_diversity_similarity += avg_song_diversity_similarity
+
+  # Calculate overall averages for the dataset
+  avg_sentiment_similarity = total_sentiment_similarity / total_songs
+  avg_cosine_similarity = total_cosine_similarity / total_songs
+  avg_structure_similarity = total_structure_similarity / total_songs
+  avg_diversity_similarity = total_diversity_similarity / total_songs
+
+  print(f"Average Sentiment Similarity: {avg_sentiment_similarity:.4f}")
+  print(f"Average Cosine Similarity: {avg_cosine_similarity:.4f}")
+  print(f"Average Structure Similarity: {avg_structure_similarity:.4f}")
+  print(f"Average Diversity Similarity: {avg_diversity_similarity:.4f}")
+
+  return avg_sentiment_similarity, avg_cosine_similarity, avg_structure_similarity, avg_diversity_similarity
+
+
+model = LyricsGAN(word2vec=word2vec, criterion=combined_loss)
+checkpoint = torch.load("best_model.pth")
+model.load_state_dict(checkpoint)
+
+evaluate_model(model, test_dataloader)
+song_idx = 0
+with torch.no_grad():
+    for inputs, _, midi_vector in test_dataloader:
+        inputs = inputs.to(model.device)
+        midi_vector = midi_vector.to(model.device)
+
+        original_song = [model.word2vec_model.index_to_key[idx.item()] for idx in inputs[0]]
+        first_word = original_song[0]
+        print(f"\nLyrics #{song_idx + 1} - Title: {test.dataset.title[song_idx]}\nSeed: {first_word}\n")
+        generated_song = model.generate_song(first_word, midi_vector[0])
+        print(get_song(generated_song))
+        song_idx += 1
